@@ -1,0 +1,98 @@
+#!/usr/bin/env node
+// Lets Paseo use the already-running shared Codex app-server (the one Codex Desktop
+// connects to) instead of spawning its own. `app-server ...` is bridged as JSONL on
+// stdio <-> WebSocket on the app-server control socket; anything else runs real codex.
+const { spawnSync } = require("node:child_process");
+const { createRequire } = require("node:module");
+const os = require("node:os");
+const path = require("node:path");
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+const REAL_CODEX = process.env.CODEX_REAL_BIN || path.join(os.homedir(), ".local/bin/codex");
+const SOCKET = process.env.CODEX_CONTROL_SOCKET || path.join(CODEX_HOME, "app-server-control/app-server-control.sock");
+// `ws` is borrowed from the Paseo install so the bridge stays a single dependency-free file.
+const PASEO_CLI_DIR = process.env.PASEO_CLI_DIR || "/usr/lib/node_modules/@getpaseo/cli/";
+const args = process.argv.slice(2);
+
+if (args[0] !== "app-server") {
+  const r = spawnSync(REAL_CODEX, args, { stdio: "inherit" });
+  process.exit(r.status ?? 1);
+}
+
+const WebSocket = createRequire(PASEO_CLI_DIR)("ws");
+const fs = require("node:fs");
+// Frame log, opt-in: it contains full conversation content.
+const LOG_DIR = process.env.CODEX_BRIDGE_LOG_DIR;
+let logFd = null;
+if (LOG_DIR) {
+  fs.mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
+  logFd = fs.openSync(`${LOG_DIR}/${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.jsonl`, "a", 0o600);
+}
+const log = (dir, data) => {
+  if (logFd !== null) fs.writeSync(logFd, JSON.stringify({ t: new Date().toISOString(), dir, data }) + "\n");
+};
+log("meta", { argv: process.argv.slice(2) });
+const ws = new WebSocket(`ws+unix://${SOCKET}:/`);
+const pending = [];
+// Paseo skips thread/resume for threads already in thread/loaded/list (it assumes it owns
+// the server). On a shared server those threads were loaded by another client, so this
+// connection is not subscribed and never gets item/turn events. Subscribe on demand.
+const subscribed = new Set();
+const SUBSCRIBING = new Set(["thread/start", "thread/resume", "thread/fork"]);
+const pendingMethods = new Map(); // paseo request id -> method
+const resumeWaiters = new Map(); // bridge request id -> { threadId, resolve }
+let bridgeSeq = 0;
+const NEEDS_SUBSCRIPTION = new Set(["turn/start", "turn/steer", "turn/interrupt", "review/start", "thread/compact/start", "thread/goal/set", "thread/goal/clear", "thread/shellCommand", "thread/rollback"]);
+const ensureSubscribed = (threadId) => new Promise((resolve) => {
+  if (!threadId || subscribed.has(threadId)) return resolve();
+  const id = `bridge-resume-${++bridgeSeq}`;
+  resumeWaiters.set(id, { threadId, resolve });
+  const req = JSON.stringify({ id, method: "thread/resume", params: { threadId, excludeTurns: true } });
+  log("bridge->server", req);
+  send(req);
+});
+let buf = "";
+const send = (line) => (ws.readyState === WebSocket.OPEN ? ws.send(line) : pending.push(line));
+
+let queue = Promise.resolve();
+const forward = async (line) => {
+  let msg;
+  try { msg = JSON.parse(line); } catch { return send(line); }
+  if (msg && msg.id !== undefined && msg.method) pendingMethods.set(msg.id, msg.method);
+  if (msg && NEEDS_SUBSCRIPTION.has(msg.method)) await ensureSubscribed(msg.params?.threadId);
+  send(line);
+};
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let i;
+  while ((i = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    if (line) { log("paseo->server", line); queue = queue.then(() => forward(line)); }
+  }
+});
+process.stdin.on("end", () => ws.close());
+ws.on("open", () => { for (const l of pending.splice(0)) ws.send(l); });
+ws.on("message", (m, isBinary) => {
+  const text = String(m);
+  try {
+    const msg = JSON.parse(text);
+    if (msg && typeof msg.id === "string" && resumeWaiters.has(msg.id)) {
+      const w = resumeWaiters.get(msg.id); resumeWaiters.delete(msg.id);
+      if (!msg.error) subscribed.add(w.threadId);
+      log("server->bridge", text.slice(0, 500));
+      return w.resolve();
+    }
+    if (msg && msg.id !== undefined && pendingMethods.has(msg.id)) {
+      const method = pendingMethods.get(msg.id); pendingMethods.delete(msg.id);
+      // Only start/resume/fork subscribe this connection; thread/read etc. do not.
+      if (SUBSCRIBING.has(method) && !msg.error && msg.result?.thread?.id) subscribed.add(msg.result.thread.id);
+    }
+  } catch {}
+  log(isBinary ? "server->paseo(binary)" : "server->paseo", text);
+  process.stdout.write(text + "\n");
+});
+process.stdout.on("error", () => { ws.close(); process.exit(0); });
+ws.on("close", (code, reason) => { log("meta", { wsClose: code, reason: String(reason) }); process.exit(0); });
+ws.on("error", (e) => { process.stderr.write(`codex-shared-bridge: ${e.message}\n`); process.exit(1); });
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { ws.close(); process.exit(0); });
